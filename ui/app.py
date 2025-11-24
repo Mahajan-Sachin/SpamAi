@@ -1,85 +1,93 @@
 import streamlit as st
-import requests
-import time
+import joblib
+import pandas as pd
+import os
 
-API_URL = "http://127.0.0.1:5000"
-
-st.set_page_config(
-    page_title="AI Spam Classifier",
-    page_icon="📩",
-    layout="centered"
-)
-
-st.markdown("""
-# 📩 AI-Augmented Spam Detector  
-### Hybrid ML + Optional AI Semantic Check  
----
-""")
-
-# -----------------------------------------
-# INPUT
-# -----------------------------------------
-message = st.text_area("✉️ Enter SMS message:", height=120)
-
-# Store results using session_state
-if "svm_result" not in st.session_state:
-    st.session_state.svm_result = None
-
-if "ai_result" not in st.session_state:
-    st.session_state.ai_result = None
+from ai.llm_check import llm_check
 
 
-# -----------------------------------------
-# BUTTON 1 → SVM ONLY
-# -----------------------------------------
-if st.button("🔍 Predict (SVM Only)", use_container_width=True):
-    if not message.strip():
-        st.warning("⚠ Please type a message first.")
-        st.stop()
+st.set_page_config(page_title="AI Spam Detector", layout="wide")
 
-    with st.spinner("Running SVM model..."):
-        try:
-            svm_res = requests.post(f"{API_URL}/predict-svm",
-                                    json={"message": message}).json()
-            st.session_state.svm_result = svm_res
-        except Exception as e:
-            st.error(f"❌ API Error (SVM): {e}")
+# ----------------------
+# Load ML Model
+# ----------------------
+MODEL_PATH = "model/svm_model.pkl"
+VECTORIZER_PATH = "model/vectorizer.pkl"
 
-    st.session_state.ai_result = None  # Reset AI result
+svm_model = joblib.load(MODEL_PATH)
+vectorizer = joblib.load(VECTORIZER_PATH)
 
 
-# Display SVM result if available
-if st.session_state.svm_result:
-    svm_res = st.session_state.svm_result
-    svm_label = svm_res["svm_label"]
-    color = "🟢" if svm_label == "ham" else "🔴"
-
-    st.markdown("## 📌 Results")
-    st.write("---")
-    st.markdown(f"### {color} SVM Prediction")
-    st.write(f"**Label:** {svm_label}")
-    st.write("---")
-
-# -----------------------------------------
-# BUTTON 2 → OPTIONAL AI CHECK (LLM)
-# -----------------------------------------
-if st.session_state.svm_result:  # Show only after SVM result
-    if st.button("🤖 Advanced Check (AI)", use_container_width=True):
-        with st.spinner("Calling AI model..."):
-            try:
-                ai_res = requests.post(f"{API_URL}/advanced-check",
-                                       json={"message": message}).json()
-                st.session_state.ai_result = ai_res
-            except Exception as e:
-                st.error(f"❌ API Error (AI): {e}")
+def predict_svm(message):
+    X = vectorizer.transform([message])
+    pred = svm_model.predict(X)[0]
+    return int(pred)  # 1 = spam, 0 = ham
 
 
-# Display AI results if available
-if st.session_state.ai_result:
-    ai_res = st.session_state.ai_result
-    ai_label = ai_res.get("label", "error")
+def save_disagreement(msg, ai_label):
+    """Save disagreement rows for future retraining."""
+    path = "data/new_training_samples.csv"
 
-    st.markdown("## 🧠 AI (LLM) Prediction")
-    st.write(f"**Label:** {ai_label}")
-    st.write(f"**Confidence:** {ai_res.get('confidence', '?')}")
-    st.info(ai_res.get("explanation", "No explanation available."))
+    df = pd.DataFrame([{
+        "message": msg,
+        "label": ai_label
+    }])
+
+    header = not os.path.exists(path)
+    df.to_csv(path, mode="a", index=False, header=header)
+
+
+# ----------------------
+# UI Section
+# ----------------------
+
+st.title("📡 AI-Augmented Spam Detector")
+st.write("Hybrid ML + LLM Spam Detection System")
+
+message = st.text_area("Enter SMS message:", height=120)
+
+if st.button("🔍 Predict (SVM Only)"):
+    if message.strip() == "":
+        st.warning("Please enter a message.")
+    else:
+        pred = predict_svm(message)
+        label = "spam" if pred == 1 else "ham"
+
+        st.subheader("📌 Results")
+        st.write(f"**SVM Prediction:** `{label}`")
+
+        st.session_state["svm_result"] = pred
+        st.session_state["sms"] = message
+
+
+# ----------------------
+# Advanced Check (AI)
+# ----------------------
+
+if "svm_result" in st.session_state:
+
+    st.divider()
+    st.subheader("🤖 Advanced Check (LLM AI)")
+
+    if st.button("🧠 Run AI Check"):
+        msg = st.session_state["sms"]
+        svm_pred = st.session_state["svm_result"]
+
+        with st.spinner("Analyzing with Qwen LLM..."):
+            ai = llm_check(msg)
+
+        st.write("### 🧠 AI (LLM) Prediction")
+        st.json(ai)
+
+        ai_label = ai.get("label", "error").lower()
+        ai_num = 1 if ai_label == "spam" else 0
+
+        # disagreement?
+        if ai_label == "error":
+            st.error("❌ AI returned invalid JSON.")
+        else:
+            if ai_num != svm_pred:
+                st.warning("⚠ ML and AI disagree — saved for retraining.")
+                save_disagreement(msg, ai_label)
+            else:
+                st.success("✔ ML and AI agree.")
